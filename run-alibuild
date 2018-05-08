@@ -1,0 +1,91 @@
+#!/bin/bash
+
+patch_cray_pe()
+{
+    if [[ -n "${CRAY_CC_VERSION}" ]]; then
+	# Cray Compiling Environment (CCE) does not accept source code
+	# from the standard input, there is no easy way to make it
+	# work with AliBuild
+	echo "${application}: error: Compiler wrapper cannot be set to Cray Compiling Environment (CCE), do either \`module swap PrgEnv-cray PrgEnv-intel' or \`module swap PrgEnv-cray PrgEnv-gnu'" 1>&2
+	exit 1
+    fi
+    # Cray compiler wrappers by default set "-static", unless with
+    # "-dynamic", and it does not pass "-L" to the linker unless with
+    # "-Wl"
+    /usr/bin/sed -i -e \
+	"s@ cc -xc .*-l@ cc -xc -dynamic -l@" \
+	ali-master/alidist/curl.sh
+    /usr/bin/sed -i -e \
+	"s@ cc -xc -lperl -L\\(.*\\) -I@ cc -xc -dynamic -lperl -L\\1 -Wl,-L\\1 -I@" \
+	ali-master/alidist/libperl.sh
+    # Protect Cray PE environment variables from being unset
+    /usr/bin/sed -i -e \
+	"s@ and x != \"ALIBUILD_VERSION\":@ and not x in ('ALIBUILD_VERSION', 'CRAYPE_VERSION', 'CRAY_LIBSCI_VERSION', 'DVS_VERSION', 'GCC_VERSION', 'GNU_VERSION', 'INTEL_MAJOR_VERSION', 'INTEL_MINOR_VERSION', 'INTEL_VERSION', 'LIBSCI_VERSION'):@" \
+	alibuild/alibuild_helpers/utilities.py
+    # Directories on GPFS do change after the compilation, tar cannot
+    # be required to return 0
+    /usr/bin/sed -i -e \
+	"/^\$MY_TAR.*-c/i set +e" -e "/^\$MY_TAR.*-c/a set -e" \
+	alibuild/alibuild_helpers/build_template.sh
+    # SLES is considerd "unknown"
+    force="--force-unknown-architecture"
+}
+
+load_cray_module_gcc()
+{
+    # Replace Cray wrappers by NERSC installed Cray Modules of GCC,
+    # cause it to be detected by aliBuild
+    eval $(modulecmd bash load gcc)
+    # Ugly work-around for the NERSC specific installation, where gcc
+    # and g++ are shell scripts
+    gcc_prefix="$(/usr/bin/readlink -f $(/usr/bin/dirname \
+$(/usr/bin/which gcc))/../snos)"
+    mkdir -p usr/bin
+    ln -sf "${gcc_prefix}/bin/gcc" usr/bin/cc
+    ln -sf "${gcc_prefix}/bin/g++" usr/bin/c++
+    export PATH="$(/usr/bin/readlink -f usr/bin):$PATH"
+}
+
+application="$(basename "$0")"
+root6=""
+module_gcc=""
+prefix="$HOME/alice"
+for o in "$@"; do
+    case "${o}" in
+	--root6)
+	    root6=1
+	    ;;
+	--module-gcc)
+	    module_gcc=1
+	    ;;
+	--prefix=*)
+	    prefix="$(echo "$o" | sed "s/[^=]*=//")"
+	    ;;
+    esac
+done
+
+[[ -d "${prefix}" ]] || /usr/bin/mkdir -p "${prefix}"
+
+pushd "${prefix}"
+if [[ ! -d "${prefix}/alibuild" ]]; then
+    /usr/bin/git clone https://github.com/alisw/alibuild
+fi
+aliBuild="nice -19 ${prefix}/alibuild/aliBuild"
+alienv="${prefix}/alibuild/alienv"
+$aliBuild init AliRoot,AliPhysics -z ali-master
+[[ -n "${root6}" ]] && \
+    $aliBuild init ROOT --dist IB/master/root6 -z root6 ${force}
+[[ -n "${CRAYPE_VERSION}" ]] && patch_cray_pe
+[[ -n "${module_gcc}" ]] && load_cray_module_gcc
+popd # "${prefix}"
+
+pushd "${prefix}/ali-master"
+$aliBuild -z -w ../sw -d build AliPhysics ${force}
+popd # "${prefix}/ali-master"
+if [[ -n "${root6}" ]]; then
+    pushd "${prefix}/root6"
+    export CMAKE_C_COMPILER=gcc
+    export CMAKE_CXX_COMPILER=g++
+    $aliBuild -z -d -w ../sw build ROOT ${force}
+    popd # "${prefix}/root6"
+fi # [[ -n "${root6}" ]]; then
