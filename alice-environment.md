@@ -11,7 +11,7 @@ alice_haswell="/project/projectdirs/project1/user2/alice-haswell"
 alice_analysis_data="/project/projectdirs/project1/user2/analysis-data"
 alice_aliphysics_latest="AliPhysics/latest-ali-master-release"
 if [[ "${NERSC_HOST}" = cori && -d "${alice_haswell}" ]]; then
-    export PATH="${PATH}:$alice_haswell/alibuild"
+    export PATH="${PATH}:${alice_haswell}/alibuild"
     export ALIBUILD_WORK_DIR="${alice_haswell}/sw"
     alias alish="eval \$(alienv load ${alice_aliphysics_latest})"
     [[ -d "${alice_analysis_data}" ]] && \
