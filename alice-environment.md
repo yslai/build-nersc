@@ -4,18 +4,19 @@ The script `run-alibuild --prefix=/project/projectdirs/project1/user2/alice-hasw
 
 A CERN account is still needed to pull DPMJET from protected CERN GitLab ([alidist issue #833](https://github.com/alisw/alidist/issues/833)).
 
-Example `.bash_profile.ext` snippet for both Cori and with PDSF using CVMFS, where the user is expected to executes `alish` to load the ALICE environment:
+Example `.bash_profile.ext` snippet for both Cori and with PDSF using CVMFS, where the user is expected to executes `alish` to load the ALICE environment (replacing `project1/user2` with your project and user ID):
 
 ```
 alice_haswell="/project/projectdirs/project1/user2/alice-haswell"
 alice_analysis_data="/project/projectdirs/project1/user2/analysis-data"
 alice_aliphysics_latest="AliPhysics/latest-ali-master-release"
 if [[ "${NERSC_HOST}" = cori && -d "${alice_haswell}" ]]; then
-    export PATH="${PATH}:${alice_haswell}/alibuild"
-    export ALIBUILD_WORK_DIR="${alice_haswell}/sw"
-    alias alish="eval \$(alienv load ${alice_aliphysics_latest})"
-    [[ -d "${alice_analysis_data}" ]] && \
-        export ALICE_DATA="${alice_analysis_data}"
+    alias alish="\
+export PATH=\"\${PATH}:${alice_haswell}/alibuild\"; \
+export ALIBUILD_WORK_DIR=\"${alice_haswell}/sw\"; \
+[ -d "${alice_analysis_data}" ] && \
+export ALICE_DATA="${alice_analysis_data}"; \
+eval \$(alienv load ${alice_aliphysics_latest})"
 elif [[ -d /cvmfs ]]; then
     source /cvmfs/alice.cern.ch/etc/login.sh
     alias alish="eval \$(alienv load AliPhysics)"
