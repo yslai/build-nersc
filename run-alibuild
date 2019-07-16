@@ -1,5 +1,121 @@
 #!/bin/bash
 
+if [[ "${EUID}" = 0 ]]; then
+    echo "error: root should not run $(basename "$0")" 1>&2
+    exit 1
+fi
+
+alienv_follow_symbolic_link()
+{
+    # Make alienv follow symbolic link
+    /usr/bin/sed -i -e "s/(find \\\$/(find -L \\\$/" alibuild/alienv
+}
+
+alidist_general()
+{
+    # Disable the rounding check in CGAL so the resulting code using
+    # the library can be debugged with Valgrind
+    /usr/bin/sed -i -e \
+	"s/\\(cmake \\.\\) .*\\(\\\\\\)/\\1 -DCMAKE_CXX_FLAGS=\"-DCGAL_DISABLE_ROUNDING_MATH_CHECK\" \\2/" \
+	alidist/cgal.sh
+    /usr/bin/sed -i -e \
+	"s/\\(ADDITIONAL_FLAGS=\"\\).*\\(-L\$GMP_ROOT\\)/\\1-DCGAL_DISABLE_ROUNDING_MATH_CHECK \\2/" \
+	alidist/fastjet.sh
+    # The underlying SLES has a GCC with "Stack Clash" protection, and
+    # therfore the Perl MakeMaker will default to this particular
+    # compiler option, which the ALICE software GCC will not have
+    /usr/bin/sed -i -e \
+	"s<.*make\$</usr/bin/sed -i -e \"s>\\\\(Makefile\\\\.PL;\\\\).*\\\\(make;\\\\)>\\\\1 /usr/bin/sed -i -e \\\\\"s@ -fstack-clash-protection @ @\\\\\" Makefile; \\\\2>\" client/gclientlib/Makefile; make<" \
+	alidist/xalienfs.sh
+}
+
+alidist_gnu()
+{
+    # Experimental settings for memory debugging, not active at the
+    # moment
+    #
+#     extra="-fsanitize=address -fno-omit-frame-pointer \
+# -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=1 -fstack-protector"
+#     for f in alidist/aliroot*.sh alidist/aliphysics*.sh; do
+#     	/usr/bin/sed -i -e \
+#     	    "s/\\(cmake\\)[^\"]*\\(\"\\\$\\|\\\$\\)/\\1 -DCMAKE_CXX_FLAGS=\"\${CXXFLAGS} ${extra}\" \\2/" "$f"
+#     done
+    #
+    # AliPhysics is missing the setting for the Fortran compiler being
+    # gfortran (while AliRoot has it). If not set, CMake will default
+    # to Cray's Fortran wrapper, ftn, which cannot produce dynamic
+    # libraries.
+    /usr/bin/sed -i -e \
+	"s/^\\( *\\)\\(-DROOTSYS=\\)/\\1-DCMAKE_Fortran_COMPILER=gfortran \\2/" \
+	alidist/aliphysics.sh
+}
+
+detect_intel_cpu()
+{
+    # CPU detection
+    intel_compiler_x=""
+    if /usr/bin/grep -q "flags[^ ]*: .* avx512pf avx512er" \
+	/proc/cpuinfo; then
+	intel_compiler_x="KNL"
+    elif /usr/bin/grep -q "flags[^ ]*: .* avx2" /proc/cpuinfo; then
+	intel_compiler_x="HASWELL"
+    elif /usr/bin/grep -q "flags[^ ]*: .* f16c rdrand" \
+	/proc/cpuinfo; then
+	intel_compiler_x="IVYBRIDGE"
+    elif /usr/bin/grep -q \
+	"model[^ ]*: \\(4[235689]\\|[5-9][0-9]\\)" \
+	/proc/cpuinfo; then
+	intel_compiler_x="SANDYBRIDGE"
+    fi
+}
+
+alidist_intel()
+{
+    # Modifications to force ALICE software being built with Intel
+    # C++/Fortran compiler
+    #
+    # Example for the first option: IVYBRIDGE, HASWELL, KNL
+    opt="-g -O3 -no-prec-div -fp-model fast=2 -ax${1}"
+    configure_opt="CC=icc CXX=icpc F77=ifort \
+CFLAGS=\"\$(echo \"\${CFLAGS}\" | sed \"s/-g -O[0-9]//\") ${opt}\" \
+CXXFLAGS=\"\$(echo \"\${CXXFLAGS}\" | sed \"s/-g -O[0-9]//\") ${opt}\" \
+F77FLAGS=\"\$(echo \"\${F77FLAGS}\" | sed \"s/-g -O[0-9]//\") ${opt}\""
+    cmake_opt="-DCMAKE_C_COMPILER=icc -DCMAKE_CC_COMPILER=icc \
+-DCMAKE_CXX_COMPILER=icpc -DCMAKE_Fortran_COMPILER=ifort \
+-DCMAKE_C_FLAGS=\"${opt}\" -DCMAKE_CXX_FLAGS=\"${opt}\" \
+-DCMAKE_Fortran_FLAGS=\"${opt}\""
+    # Fake GCC-Toolchain
+    /usr/bin/sed -i -e "/which gfortran /{s/gfortran /ifort /g};\
+/which cc /{s/ cc/ icc/g;s/\\([ \\/]\\)c++ /\\1icpc /g};" \
+	alidist/gcc-toolchain.sh
+    # Boost
+    /usr/bin/sed -i -e "s@\\(TOOLSET=\\)[^ ]*@\\1intel@;s@^.*\$EXTRA_CXXFLAGS@   cxxflags=\"${opt}\" \$EXTRA_CXXFLAGS@" \
+	alidist/boost.sh
+    # CMake itself
+    /usr/bin/sed -i -e "s@.*\\(\$SOURCEDIR/bootstrap  \\)[^ ]*@${configure_opt} \\1@" \
+	alidist/cmake.sh
+    # Autoconf-like (ApMon-CPP, GSL, SWIG, xalienfs)
+    for p in apmon-cpp gsl swig xalienfs; do
+	/usr/bin/sed -i -e \
+	    "s@\\(./configure\\).*\\(--prefix=\\|--disable-ccache\\)@\\1 ${configure_opt} \\2@" \
+	    "alidist/${p}.sh"
+    done
+    # CMake-like (XRootD)
+    /usr/bin/sed -i -e "s@\\(cmake\\).*\\(\"\$SOURCEDIR\"\\)@\\1 ${cmake_opt} \\2@" \
+	alidist/xrootd.sh
+    # ROOT
+    /usr/bin/sed -i -e "s@\\(COMPILER_CC=\\)[^ ]*@\\1icc@;\
+s@\\(COMPILER_CXX=\\)[^ ]*@\\1icpc@;\
+s@\\(COMPILER_LD=\\)[^ ]*@\\1icpc@;\
+s@\\(--with-f77=\\)[^ ]*@\\1ifort@;
+s@\\(-DCMAKE_Fortran_COMPILER=\\)[^ ]*@\\1ifort@;" \
+	alidist/root.sh
+    # UUID
+    /usr/bin/sed -i -e \
+	"s@\\(./configure\\).*\\(\$(\\[\\[\\)@\\1 ${configure_opt} \\2@" \
+	alidist/uuid.sh
+}
+
 patch_cray_pe()
 {
     if [[ -n "${CRAY_CC_VERSION}" ]]; then
@@ -40,26 +156,92 @@ load_cray_module_gcc()
     # and g++ are shell scripts
     gcc_prefix="$(/usr/bin/readlink -f $(/usr/bin/dirname \
 $(/usr/bin/which gcc))/../snos)"
-    mkdir -p usr/bin
-    ln -sf "${gcc_prefix}/bin/gcc" usr/bin/cc
-    ln -sf "${gcc_prefix}/bin/g++" usr/bin/c++
+    /usr/bin/mkdir -p usr/bin
+    /usr/bin/ln -sf "${gcc_prefix}/bin/gcc" usr/bin/cc
+    /usr/bin/ln -sf "${gcc_prefix}/bin/g++" usr/bin/c++
     export PATH="$(/usr/bin/readlink -f usr/bin):$PATH"
 }
 
+aliroot_bugfix()
+{
+    # A bugfix needed to run GEANT simulation on SLES, where its
+    # particular glibc will detect a memory bug
+    cat <<EOF | base64 -d | gzip -dc | patch -p1
+H4sICMrXNlsCA2FsaXJvb3QtaW52YWxpZF9yZWFkLTIwMTgwNjI5LnBhdGNoAKVWbW/iS
+Az+vPkVPk6qQgOBUJqW0q56ut6+6Kq7lVrdl2q1GhKHTBsyKJmwoFX/+3kyeS2UstpIkM
+R+5rHHHtvxeRBAvz/nEtjg0+394P7Ln7d8Nvgj4vSmXsTc9tZrmO3TGjz2cQ3O6ZCdn4+
+d01PbDsZDxx2OZswBZzh0x2Oj3+/vt2FYlvWGnetr6E96zgSsSW80getrAwz4ncdelPkI
+nRY+7JCy3xRdXNzT/y2uMIK2PNDSq7b06R8R49SwDuP4iDIXmyvB/a5h/TAsgFQyyT14j
+aGwC1ew27KiSFBmSVxCSfisNu2JOJXghSw5frn2r9gnwk5nuhf1JUHvANgnyuvbqJuay+
+inMuHxnP6RLbbifJeLaRct1NFWKDVuVyxbC2vCKtfEMCfAluVaNW2FtfLojbh+iLI0NLs
+GbCe2NPnCiAEAgwGkiBAi8zGBgEcIgUjAi1iagi+8bIGxohKxQvNYEnyFCZebq+FUifR2
+QSScWM1OpzvNq2A06VEVnKh/ej3A64qJS0yazAtMUzZHTV364LH4jtzKUuVFH6owwfv3l
+YO54nuotmT+VgJsFIHZ7VKQSNlepw1T7Or0dtt8Vs3XwNSUlqJ8sbraDnkegNnw/GoIR0
+e53vbEYskSNJux+Rs3/+ZB7RJSsYO+KGPc5x6TmIcBRFAEv4xUCWyYcnRSzh2VlInzE0m
+B1qGxi7v5pGUfmGRRr7Bve98oZWa3B0+4+S4SvxYUnpWCbhGQGYXpKX9+bibR9iJkBHuZ
+jFpenw5cLOVGn40mgzKTq7ZJmiqo6izvDarC/EMmTrhnDoTFtDk7c4PJmTs7Z7Y9Gwfjk
+2DmuZPDpk34xqwJ83S6w97oBCy6OeM8oXnRNoGgj83g+DgP+LEKBMgQQbcnW0sHKnQ7ut
+dR6yz/eNmRnl9peq1lqvHt9CAqelKkpsYOR+ohVA2upg962DRd2LVAW18mfEXlcqHYyRF
+g7R4tBR0CD/kKc8dEJpeZfD0qdQDggKvor2wmVmj0Sw+aAaCeSy3gtc2XO4UDr9326EBU
+9jhVPYs9bFvcMyh+zqJONjWX5UZ3mCTzJE2UZSJCPqNu5yvDhGqeU1P3oqboSJdnnq805
+fNYDSIQS0zYNl2raD/f36lfyheqaOhp5TgfUSxQJpu7u5vic/EAVFHIQRBMJu7IZVTI/u
+mpOwrOAobtQj6ETZf0IUhV3GP33O05I7D0Q17g6msDdq26uLhlG0xc856E/4mIpvYxLIQ
+Mu7r+f+UqvhJukEWRoLGjZ/JCJJtfp6bqVV8b5udYfpPA6RttOKXbJR3Ap0jtKM4WM5qf
+wC2rGrDq8jFCGoA0mCWuI57KB/417/TPyiniLCmvFOHlLjqKzLsa+KiAj5cx+nNMLYeeC
+UKIdy1LZOXhkQxBKV6ILFYRSbPlUhCCVq9Qnffcnwr28LUmoEH1brf7Tfg65T421jR1mz
+26tUdlgklD+z/6AfP6Qw0AAA==
+EOF
+}
+
+aliroot_update_pythia8()
+{
+    pythia_version="8235"
+    wget -N "http://home.thep.lu.se/~torbjorn/pythia8/pythia${pythia_version}.tgz"
+}
+
+aliroot_add_herwig7()
+{
+    thepeg_version="2.1.4"
+    wget -N "https://www.hepforge.org/archive/thepeg/ThePEG-${thepeg_version}.tar.bz2"
+}
+
 application="$(basename "$0")"
+update=""
 root6=""
 module_gcc=""
-prefix="$HOME/alice"
+intel=""
+default=""
+prefix="${HOME}/alice"
+[[ -d "${prefix}" ]] && prefix="${HOME}/alice-test"
+package="AliRoot,AliPhysics,AliRoot-OCDB"
 for o in "$@"; do
     case "${o}" in
+	--update)
+	    update=1
+	    ;;
 	--root6)
 	    root6=1
 	    ;;
 	--module-gcc)
 	    module_gcc=1
 	    ;;
+	--intel)
+	    intel=1
+	    ;;
+	--debug)
+	    default="--defaults debug"
+	    ;;
 	--prefix=*)
 	    prefix="$(echo "$o" | sed "s/[^=]*=//")"
+	    ;;
+	--package=*)
+	    package="$(echo "$o" | sed "s/[^=]*=//")"
+	    ;;
+	--*dpg*)
+	    package="${package},AliDPG"
+	    ;;
+	--*generator*)
+	    package="${package},AliGenerators"
 	    ;;
     esac
 done
@@ -70,22 +252,60 @@ pushd "${prefix}"
 if [[ ! -d "${prefix}/alibuild" ]]; then
     /usr/bin/git clone https://github.com/alisw/alibuild
 fi
-aliBuild="nice -19 ${prefix}/alibuild/aliBuild"
+alienv_follow_symbolic_link
+aliBuild="/usr/bin/nice -19 ${prefix}/alibuild/aliBuild"
 alienv="${prefix}/alibuild/alienv"
-$aliBuild init AliRoot,AliPhysics -z ali-master
-[[ -n "${root6}" ]] && \
-    $aliBuild init ROOT --dist IB/master/root6 -z root6 ${force}
+if [[ -n "${update}" ]]; then
+    for d in sw/MIRROR/*; do
+	pushd "$d"
+	git remote update
+	popd
+    done
+    # Then how with mirror?
+    # git checkout master
+    # git reset --hard origin/master
+    # git pull a-repo-url +refs/heads/*:refs/heads/*
+    # tag?
+    :
+else
+    $aliBuild init "${package}" -z ali-master
+fi
+if [[ -n "${root6}" ]]; then
+    $aliBuild init ROOT --dist IB/master/root6 -z root6 \
+	${default} ${force}
+fi
 [[ -n "${CRAYPE_VERSION}" ]] && patch_cray_pe
 [[ -n "${module_gcc}" ]] && load_cray_module_gcc
 popd # "${prefix}"
 
 pushd "${prefix}/ali-master"
-$aliBuild -z -w ../sw -d build AliPhysics ${force}
+alidist_general
+if [[ -n "${intel}" ]]; then
+    detect_intel_cpu
+    alidist_intel "${intel_compiler_x}"
+else
+    alidist_gnu
+fi
+for p in $(echo "${package}" | /usr/bin/tr , " "); do
+    case "${p}" in
+	AliRoot) ;;
+	*) $aliBuild -z -w ../sw -d build "${p}" \
+	    ${default} ${force} ;;
+    esac
+done
 popd # "${prefix}/ali-master"
+# Fix for AliEve
+# /home/ylaiali/alice/sw/slc7_x86-64/AliRoot/src/OCDB
+# pushd "${prefix}"/sw/*/AliRoot/src/OCDB
+# ln -sf ../../../AliRoot-OCDB/latest-ali-master-release/OCDB/* .
+# popd
+# pushd "${prefix}"/sw/*/AliRoot/ali-master-1/EVE/macros/data
+# ln -sf ../../../../../../../ali-master/AliRoot/EVE/oldStuff/macros/VizDB_scan.C .
+# popd
 if [[ -n "${root6}" ]]; then
     pushd "${prefix}/root6"
     export CMAKE_C_COMPILER=gcc
     export CMAKE_CXX_COMPILER=g++
-    $aliBuild -z -d -w ../sw build ROOT ${force}
+    $aliBuild -z -d -w ../sw build ROOT ${default} ${force}
     popd # "${prefix}/root6"
 fi # [[ -n "${root6}" ]]; then
