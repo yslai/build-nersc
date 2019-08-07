@@ -27,6 +27,15 @@ alidist_general()
     /usr/bin/sed -i -e \
 	"s<.*make\$</usr/bin/sed -i -e \"s>\\\\(Makefile\\\\.PL;\\\\).*\\\\(make;\\\\)>\\\\1 /usr/bin/sed -i -e \\\\\"s@ -fstack-clash-protection @ @\\\\\" Makefile; \\\\2>\" client/gclientlib/Makefile; make<" \
 	alidist/xalienfs.sh
+    # Not fixed in ALICE's ROOT:
+    # https://github.com/root-project/root/commit/
+    # 511ae175e21c6b5fa32201de23b379f80ed37981
+    /usr/bin/sed -i -e "s@^\\( *\\).*\\(cmake --build.*\\)@\\1/usr/bin/sed -i -e \"s/^#include <my_global.h>//\" \"\${SOURCEDIR}/sql/mysql/src/TMySQLServer.cxx\"; \\2@" \
+	alidist/root.sh
+    # There is no memory issue on HPC systems
+    for m in dds qualitycontrol root; do
+	/usr/bin/sed -i -e "s/ *JOBS=\$.*//" alidist/${m}.sh
+    done
 }
 
 alidist_gnu()
