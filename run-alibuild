@@ -11,7 +11,14 @@ alienv_follow_symbolic_link()
     /usr/bin/sed -i -e "s/(find \\\$/(find -L \\\$/" alibuild/alienv
 }
 
-alidist_general()
+patch_alibuild()
+{
+    /usr/bin/sed -i -e \
+	"s/\\(processor\\.\\)\\(replace(\\)/\\1decode().\\2/" \
+	alibuild/alibuild_helpers/utilities.py
+}
+
+patch_alidist_general()
 {
     # Disable the rounding check in CGAL so the resulting code using
     # the library can be debugged with Valgrind
@@ -19,7 +26,7 @@ alidist_general()
 	"s/\\(cmake \\.\\) .*\\(\\\\\\)/\\1 -DCMAKE_CXX_FLAGS=\"-DCGAL_DISABLE_ROUNDING_MATH_CHECK\" \\2/" \
 	alidist/cgal.sh
     /usr/bin/sed -i -e \
-	"s/\\(ADDITIONAL_FLAGS=\"\\).*\\(-L\$GMP_ROOT\\)/\\1-DCGAL_DISABLE_ROUNDING_MATH_CHECK \\2/" \
+	"s/\\(ADDITIONAL_FLAGS=\"\\)\\([^ ]*-L\$GMP_ROOT\\)/\\1-DCGAL_DISABLE_ROUNDING_MATH_CHECK \\2/" \
 	alidist/fastjet.sh
     # The underlying SLES has a GCC with "Stack Clash" protection, and
     # therfore the Perl MakeMaker will default to this particular
@@ -27,18 +34,24 @@ alidist_general()
     /usr/bin/sed -i -e \
 	"s<.*make\$</usr/bin/sed -i -e \"s>\\\\(Makefile\\\\.PL;\\\\).*\\\\(make;\\\\)>\\\\1 /usr/bin/sed -i -e \\\\\"s@ -fstack-clash-protection @ @\\\\\" Makefile; \\\\2>\" client/gclientlib/Makefile; make<" \
 	alidist/xalienfs.sh
-    # Not fixed in ALICE's ROOT:
+    # Not fixed in ALICE's outdated ROOT version, but breaks with
+    # MariaDB in CLE 7/SLES 15:
     # https://github.com/root-project/root/commit/
     # 511ae175e21c6b5fa32201de23b379f80ed37981
     /usr/bin/sed -i -e "s@^\\( *\\).*\\(cmake --build.*\\)@\\1/usr/bin/sed -i -e \"s/^#include <my_global.h>//\" \"\${SOURCEDIR}/sql/mysql/src/TMySQLServer.cxx\"; \\2@" \
 	alidist/root.sh
-    # There is no memory issue on HPC systems
+    # Cython needs to be installed first to prevent compilation
+    # failure as a dependency on RHEL/RHSCL
+    /usr/bin/sed -i -e "s/\\(-IU\\) \\(numpy\\)/\\1 cython \\2/" \
+	alidist/python-modules.sh
+    # The memory limit is not applicable to modern HPC systems, e.g.
+    # Cori's login nodes have 8 GB RAM per core
     for m in dds qualitycontrol root; do
 	/usr/bin/sed -i -e "s/ *JOBS=\$.*//" alidist/${m}.sh
     done
 }
 
-alidist_gnu()
+patch_alidist_gnu()
 {
     # Experimental settings for memory debugging, not active at the
     # moment
@@ -78,7 +91,7 @@ detect_intel_cpu()
     fi
 }
 
-alidist_intel()
+patch_alidist_intel()
 {
     # Modifications to force ALICE software being built with Intel
     # C++/Fortran compiler
@@ -134,6 +147,12 @@ patch_cray_pe()
 	echo "${application}: error: Compiler wrapper cannot be set to Cray Compiling Environment (CCE), do either \`module swap PrgEnv-cray PrgEnv-intel' or \`module swap PrgEnv-cray PrgEnv-gnu'" 1>&2
 	exit 1
     fi
+    if [[ -z "${PYTHON_DIR}" ]]; then
+	# Python as installed with CLE 7 does not have requests, but
+	# NERSC's Anaconda installation does
+	echo "${application}: error: Python from CLE 7 cannot be used. Do \`module load python' first" 1>&2
+	exit 1
+    fi
     # Cray compiler wrappers by default set "-static", unless with
     # "-dynamic", and it does not pass "-L" to the linker unless with
     # "-Wl"
@@ -152,8 +171,6 @@ patch_cray_pe()
     /usr/bin/sed -i -e \
 	"/^\$MY_TAR.*-c/i set +e" -e "/^\$MY_TAR.*-c/a set -e" \
 	alibuild/alibuild_helpers/build_template.sh
-    # SLES is considerd "unknown"
-    force="--force-unknown-architecture"
 }
 
 load_cray_module_gcc()
@@ -202,6 +219,15 @@ UKIdy1LZOXhkQxBKV6ILFYRSbPlUhCCVq9Qnffcnwr28LUmoEH1brf7Tfg65T421jR1mz
 EOF
 }
 
+aliroot_compatibility()
+{
+    f="STEER/STEERBase/AliMCParticle.h"
+    /usr/bin/grep -qF GetFirstDaughter "${f}" || /usr/bin/sed -i -e \
+	"/GetDaughterFirst/{N;\
+s/\\(.*\\)\\(DaughterFirst\\)\\(.*\\)\\(DaughterLast\\)\\(.*\\)/\\1\\2\\3\\4\\5\n\\1FirstDaughter\\3LastDaughter\\5/}" \
+	"${f}"
+}
+
 aliroot_update_pythia8()
 {
     pythia_version="8235"
@@ -216,17 +242,20 @@ aliroot_add_herwig7()
 
 application="$(basename "$0")"
 update=""
-root6=""
 module_gcc=""
 intel=""
-default=""
+user=""
+root6=""
 prefix="${HOME}/alice"
-[[ -d "${prefix}" ]] && prefix="${HOME}/alice-test"
+# [[ -d "${prefix}" ]] && prefix="${HOME}/alice-test"
 package="AliRoot,AliPhysics,AliRoot-OCDB"
 for o in "$@"; do
     case "${o}" in
 	--update)
 	    update=1
+	    ;;
+	--user)
+	    user=1
 	    ;;
 	--root6)
 	    root6=1
@@ -236,9 +265,6 @@ for o in "$@"; do
 	    ;;
 	--intel)
 	    intel=1
-	    ;;
-	--debug)
-	    default="--defaults debug"
 	    ;;
 	--prefix=*)
 	    prefix="$(echo "$o" | sed "s/[^=]*=//")"
@@ -255,11 +281,20 @@ for o in "$@"; do
     esac
 done
 
+if [[ -n "${user}" && -n "${root6}" ]]; then
+    default="--defaults user-next-root6"
+elif [[ -n "${user}" ]]; then
+    default="--defaults user"
+elif [[ -n "${root6}" ]]; then
+    default="--defaults next-root6"
+fi
+
 [[ -d "${prefix}" ]] || /usr/bin/mkdir -p "${prefix}"
 
 pushd "${prefix}"
 if [[ ! -d "${prefix}/alibuild" ]]; then
     /usr/bin/git clone https://github.com/alisw/alibuild
+    patch_alibuild
 fi
 alienv_follow_symbolic_link
 aliBuild="/usr/bin/nice -19 ${prefix}/alibuild/aliBuild"
@@ -279,22 +314,24 @@ if [[ -n "${update}" ]]; then
 else
     $aliBuild init "${package}" -z ali-master
 fi
-if [[ -n "${root6}" ]]; then
-    $aliBuild init ROOT --dist IB/master/root6 -z root6 \
-	${default} ${force}
-fi
+# As aliBuild also do not properly whitelist actual RHEL (despite
+# stating so), globally force unknown architectures
+force="--force-unknown-architecture"
 [[ -n "${CRAYPE_VERSION}" ]] && patch_cray_pe
 [[ -n "${module_gcc}" ]] && load_cray_module_gcc
 popd # "${prefix}"
 
 pushd "${prefix}/ali-master"
-alidist_general
+patch_alidist_general
 if [[ -n "${intel}" ]]; then
     detect_intel_cpu
-    alidist_intel "${intel_compiler_x}"
+    patch_alidist_intel "${intel_compiler_x}"
 else
-    alidist_gnu
+    patch_alidist_gnu
 fi
+pushd "AliRoot"
+aliroot_compatibility
+popd # "AliRoot"
 for p in $(echo "${package}" | /usr/bin/tr , " "); do
     case "${p}" in
 	AliRoot) ;;
